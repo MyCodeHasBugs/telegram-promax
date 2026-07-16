@@ -1,0 +1,41 @@
+# Build artifacts — generated, never commit
+E2EChatClient/bin/
+E2EChatClient/obj/
+dist/
+
+# Python cache
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# TLS private keys — never commit credentials
+server/certs/*.key
+server/certs/key.pem
+server/certs/key.pem.enc
+server/certs/*.p12
+server/certs/*.pfx
+
+# Any other generated private keys anywhere
+*.key
+*.pem.key
+
+# IDE / OS workspace
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userprefs
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Logs / runtime artifacts
+*.log
+server_out.txt
+server_err.txt
+kicks.log
+
+# Local work wip (kept in mind in head)

@@ -1,0 +1,7 @@
+# V2 服务器: python-socketio 原生 AsyncServer + uvicorn (ASGI)
+# (V1 已弃用 flask-socketio + gevent, 不再安装)
+python-socketio>=5.11
+uvicorn>=0.30
+websockets>=11.0
+blake3>=0.4.0
+cryptography>=42.0   # Ed25519 id_sig 服务端验证
