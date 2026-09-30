@@ -137,6 +137,14 @@ rate_log_slices: dict[str, list] = {}   # sid -> list[float]   (relay_slice)
 # rate_log_slices 同窗, 同步过期. 断连时由 disconnect 一并清掉.
 rate_log_slice_bytes: dict[str, list] = {}
 
+# N1 修复 (2026-07-16): 房密码 brute-force 防护. auth handler 加独立失败计数,
+# 不复用 relay_message 的 rate_log (那条只在校验过 auth 之后才起作用, 房密码错
+# 阶段根本进不到 relay_message). 每房每 5 分钟窗口 5 次失败即拒 + 指数退避.
+# 全内存态, 不落盘.
+ROOM_PW_FAIL_MAX        = 5
+ROOM_PW_FAIL_WINDOW_SEC = 300   # 5 min
+_room_pw_failures: dict[str, list] = {}   # room -> list[float] timestamps of failures
+
 # F3-4 房间准入: room -> {owner_sid, password_hash, created_at}
 #   password_hash = BLAKE3(room || ":" || password_hex).hex (加 room 名做域分离, 防撞表)
 #   全内存态, 不落盘; room 空 (所有 owner/member 都断开) 即 pop (disconnect 末尾清).
@@ -148,6 +156,25 @@ _lock = threading.RLock()
 
 # F3-5: 记 connect 时间, 未 auth 超时回收, 防 slot 耗尽 DoS
 _connect_times: dict[str, float] = {}
+
+# F5 房主踢人: 被踢者 10 分钟内不可再加入该房. 全内存态, 房间空即清, 不落盘.
+# 用 id_pub (Ed25519 身份公钥) 作禁入键 — sid 重连即变, epub 每会话换,
+# 唯有 id_pub 跨重连稳定且经 id_sig 验证不可伪造.
+KICK_BAN_SECONDS = 600   # 10 分钟
+_room_kicks: dict[str, dict[str, float]] = {}   # room -> {id_pub_b64 -> expiry_ts}
+
+
+def _cleanup_expired_kicks(room: str) -> None:
+    """清理本房过期的踢出禁令. 调用方需持 _lock."""
+    kicks = _room_kicks.get(room)
+    if not kicks:
+        return
+    now = _now()
+    expired = [k for k, exp in kicks.items() if exp <= now]
+    for k in expired:
+        kicks.pop(k, None)
+    if not kicks:
+        _room_kicks.pop(room, None)
 
 
 def _now() -> float:
@@ -290,7 +317,7 @@ async def connect(sid, environ):
         _connect_times[sid] = _now()
         _conn_subnet[sid] = subnet
         _subnet_conn_count[subnet] = _subnet_conn_count.get(subnet, 0) + 1
-    log.info("connect sid=%s subnet=%s", sid, subnet)
+    log.debug("connect sid=%s subnet=%s", sid, subnet)
 
 
 @sio.event
@@ -306,6 +333,8 @@ async def disconnect(sid):
                 # 防人离开后房间密码"挂在内存里" 无限重连即占名; 但 attacker 可重创建,
                 # 接受 (此设计语义: 房间非持久, 仅 owner 在线期间有密码门槛).
                 room_metadata.pop(room, None)
+                # F5: 房间空了, 踢出禁令一并清 (新房同名为不同上下文, 不继承旧禁令).
+                _room_kicks.pop(room, None)
         rate_log.pop(sid, None)
         rate_log_slices.pop(sid, None)
         rate_log_slice_bytes.pop(sid, None)   # F4-3: 清字节滑动窗口
@@ -318,7 +347,7 @@ async def disconnect(sid):
                 _subnet_conn_count.pop(subnet, None)
             else:
                 _subnet_conn_count[subnet] = n
-    log.info("disconnect sid=%s", sid)
+    log.debug("disconnect sid=%s", sid)
 
 
 @sio.event
@@ -331,6 +360,8 @@ async def auth(sid, payload):
     epub = payload.get("epub", "")
     b3   = payload.get("blake3", "")
     room = (payload.get("room") or "lobby").strip()[:30]
+    # PQ: ML-KEM-1024 公钥透传 (b64). 客户端互检微信; 服务端仅保存+转发.
+    kpub = (payload.get("kpub") or "")[:8192]
 
     if not epub or len(epub) < 16:
         await sio.emit("auth_response", {"ok": False, "reason": "epub missing/short"}, to=sid)
@@ -369,34 +400,88 @@ async def auth(sid, payload):
             return
 
     # F3-4 房间准入: 该 room 已被设密码则必须对上, 否则拒. lobby 默认无密码 (公开房).
+    # N1 修复 (2026-07-16): 独立房密码失败计数 + 滑窗限流. 原注释称 "rate_log 闸门限制",
+    # 但 rate_log 只在 relay_message 里消费, auth 不查; 旧实现下房密码可被高速穷举.
     room_pw = payload.get("room_password", "") or ""
     if not isinstance(room_pw, str):
         room_pw = ""
     with _lock:
         meta = room_metadata.get(room)
+        fail_list = _room_pw_failures.setdefault(room, [])
+        # 滑动窗口过期
+        while fail_list and _now() - fail_list[0] > ROOM_PW_FAIL_WINDOW_SEC:
+            fail_list.pop(0)
     if meta and meta.get("password_hash"):
         if not room_pw or _hash_room_password(room, room_pw) != meta["password_hash"]:
+            with _lock:
+                fail_list.append(_now())
+                fails = len(fail_list)
+            # 指数退避: 第 5 次起在 5 分钟内全拒 (含本次); 第 6+ 起也直接拒.
+            if fails >= ROOM_PW_FAIL_MAX:
+                backoff_s = min(ROOM_PW_FAIL_WINDOW_SEC,
+                                2 ** (fails - ROOM_PW_FAIL_MAX))   # 第 5→1s, 6→2s, 7→4s...
+                log.warning("room pw brute-force lockout: room=%s fails=%d/%d in %ds "
+                            "(next allowed in >=%ds)",
+                            room, fails, ROOM_PW_FAIL_MAX,
+                            ROOM_PW_FAIL_WINDOW_SEC, backoff_s)
+                # BUG-16 修复: backoff_s 之前只用于 log, 没在响应中告知客户端.
+                #   修复: 把 retry_s 放入响应, 客户端可据此提示用户等待.
+                await sio.emit("auth_response", {
+                    "ok": False,
+                    "reason": f"too many room password attempts, retry in {backoff_s}s",
+                    "retry_s": backoff_s,
+                }, to=sid)
+                # 退避期内连接斩断, 让攻击者每次都得重连 + 客户端闸门 token 验签 (id_sig)
+                await sio.disconnect(sid)
+                return
             await sio.emit("auth_response", {
                 "ok": False,
-                "reason": "room password incorrect or missing",
+                "reason": f"room password incorrect (attempt {fails}/{ROOM_PW_FAIL_MAX} in {ROOM_PW_FAIL_WINDOW_SEC}s)",
             }, to=sid)
             # 注意: 不直接 disconnect, 让客户端输错密码重试; 输错本身不是攻击.
-            # 但连续错 5 次 / 10s 内由 rate_log 闸门已限制.
+            # 但已锁定的房会由上面的 fail_list 长度判断拒.
             return
+    # 密码对 (或房非加密): 清本房失败窗口, 攻击者得手一次不长期留 fingerprint.
+    if room in _room_pw_failures:
+        with _lock:
+            _room_pw_failures.pop(room, None)
 
+    # F5 踢出禁入检查: 若该 id_pub 在本房的踢出禁令期内, 拒绝加入.
+    # id_pub 已由上面 id_sig 验证 (不可伪造), 故用 id_pub 作禁入键.
     with _lock:
+        _cleanup_expired_kicks(room)
+        ban_exp = _room_kicks.get(room, {}).get(id_pub_b64)
+    if ban_exp:
+        remain = int(ban_exp - _now())
+        await sio.emit("auth_response", {
+            "ok": False,
+            "reason": f"你已被房主踢出, {remain}s 后才可再加入该房",
+        }, to=sid)
+        await sio.disconnect(sid)
+        return
+
+    # F5 房主重连认领: 若本 sid 的 id_pub 与 room_metadata.owner_id_pub 一致,
+    # 更新 owner_sid 为当前 sid (sid 重连即变), 并在 auth_response 标记 is_owner.
+    is_owner = False
+    with _lock:
+        meta = room_metadata.get(room)
+        if meta and meta.get("owner_id_pub") == id_pub_b64:
+            meta["owner_sid"] = sid
+            is_owner = True
         sessions[sid] = {
             "sid":      sid,
             "epub":     epub,
             "id_pub":   id_pub_b64,  # F3-3: 绑定后下发给房间其他成员
             "room":     room,
+            "kpub":     kpub,        # PQ: 随成员广播透传
             "login_ts": _now(),
         }
         rooms.setdefault(room, set()).add(sid)
 
     member_list = [{"sid": o,
                      "epub": sessions[o]["epub"],
-                     "id":   sessions[o]["id_pub"]}
+                     "id":   sessions[o]["id_pub"],
+                     "kpub": sessions[o].get("kpub", "")}
                    for o in rooms.get(room, set())
                    if o != sid and o in sessions]
 
@@ -406,12 +491,13 @@ async def auth(sid, payload):
         "room":      room,
         "members":   member_list,
         "hash_algo": HASH_ALGO,
+        "is_owner":  is_owner,
     }, to=sid)
 
     for o in list(rooms.get(room, set())):
         if o != sid:
             await sio.emit("new_member",
-                {"sid": sid, "epub": epub, "id": id_pub_b64}, to=o)
+                {"sid": sid, "epub": epub, "id": id_pub_b64, "kpub": kpub}, to=o)
 
 
 @sio.event
@@ -444,6 +530,7 @@ async def create_room(sid, payload):
 
     epub = payload.get("epub", "")
     room = (payload.get("room") or "").strip()[:30]
+    kpub = (payload.get("kpub") or "")[:8192]   # PQ: ML-KEM-1024 公钥透传
     if not room:
         await sio.emit("auth_response", {"ok": False, "reason": "room name empty"}, to=sid)
         return
@@ -473,17 +560,21 @@ async def create_room(sid, payload):
     pw_hash = _hash_room_password(room, pw) if pw else ""
 
     with _lock:
-        # 已有同名带密码房间且 owner 不是本 sid -> 拒 (防撞名劫持房间)
+        # N1 附带 (2026-07-16): 已有同名的房间 (无论是否加密) 且 owner 不是本 sid -> 拒.
+        # 原条件 only 在 existing 是密码房时拒, 让攻击者可在活跃公开房名上盖章设密码 + 抢 owner.
+        # 现在只要是已有房间 (existing non-None) 且 owner 非本 sid 即拒, 公开房也防盖戳.
         existing = room_metadata.get(room)
-        if existing and existing.get("owner_sid") and existing["owner_sid"] != sid \
-                and existing.get("password_hash"):
+        already_live = room in rooms and len(rooms[room]) > 0
+        if already_live and (not existing or existing.get("owner_sid") != sid):
             await sio.emit("auth_response", {
                 "ok": False,
-                "reason": f"room '{room}' already exists with password (not owner)"
+                "reason": f"room '{room}' already in use; pick another name",
             }, to=sid)
             return
+        # owner 是本 sid 的同房可改密码 (允许改 pw 但不创建新房记录原地覆写)
         room_metadata[room] = {
             "owner_sid":      sid,
+            "owner_id_pub":   id_pub_b64,   # F5: 房主重连认领用 (sid 重连即变, id_pub 稳定)
             "password_hash":  pw_hash,
             "created_at":     _now(),
         }
@@ -494,6 +585,7 @@ async def create_room(sid, payload):
             "sid":      sid,
             "epub":     epub,
             "id_pub":   id_pub_b64,
+            "kpub":     kpub,        # PQ
             "room":     room,
             "login_ts": _now(),
         }
@@ -501,7 +593,8 @@ async def create_room(sid, payload):
 
     member_list = [{"sid": o,
                      "epub": sessions[o]["epub"],
-                     "id":   sessions[o]["id_pub"]}
+                     "id":   sessions[o]["id_pub"],
+                     "kpub": sessions[o].get("kpub", "")}
                    for o in rooms.get(room, set())
                    if o != sid and o in sessions]
 
@@ -517,7 +610,66 @@ async def create_room(sid, payload):
     for o in list(rooms.get(room, set())):
         if o != sid:
             await sio.emit("new_member",
-                {"sid": sid, "epub": epub, "id": id_pub_b64}, to=o)
+                {"sid": sid, "epub": epub, "id": id_pub_b64, "kpub": kpub}, to=o)
+
+
+@sio.event
+async def kick_member(sid, payload):
+    """F5: 房主踢出房间内某成员. 被踢者 10 分钟内不可再加入该房.
+    仅 room_metadata.owner_sid == sid 可执行; target 必须在同房且非 self.
+    禁令以 target 的 id_pub 为键写入 _room_kicks, disconnect 不会清 (房间仍在)."""
+    me = sessions.get(sid)
+    if not me:
+        await sio.emit("server_event", {"type": "reject", "reason": "no auth"}, to=sid)
+        return
+    if not isinstance(payload, dict):
+        return
+    target_sid = payload.get("target_sid", "")
+    room = me["room"]
+
+    # 锁内: 只做校验 + 写禁令, 收集结果. 锁外才做 I/O (与 relay_slice 同模式,
+    # 不在 threading.RLock 持锁时 await, 防阻塞其他等待锁的线程).
+    # deny_reason 非 None = 校验失败; target_id_pub 非 None = 校验通过可踢.
+    deny_reason: str | None = None
+    target_id_pub: str | None = None
+    with _lock:
+        meta = room_metadata.get(room)
+        if not meta or meta.get("owner_sid") != sid:
+            deny_reason = "only owner can kick"
+        elif not target_sid or target_sid == sid:
+            deny_reason = "invalid target (cannot kick self)"
+        else:
+            target_session = sessions.get(target_sid)
+            if not target_session or target_session.get("room") != room:
+                deny_reason = "target not in this room"
+            else:
+                target_id_pub = target_session.get("id_pub", "")
+                if not target_id_pub:
+                    deny_reason = "target has no id_pub"
+                else:
+                    # 写入踢出禁令 (10 分钟). 已有同 id_pub 的旧禁令覆写 (重新计时).
+                    _room_kicks.setdefault(room, {})[target_id_pub] = _now() + KICK_BAN_SECONDS
+
+    # 锁外做 I/O
+    if deny_reason is not None:
+        await sio.emit("server_event",
+                       {"type": "kick_denied", "reason": deny_reason}, to=sid)
+        return
+
+    # 校验通过: 通知被踢者
+    await sio.emit("server_event",
+                   {"type": "kicked", "reason": "removed by room owner",
+                    "room": room, "ban_seconds": KICK_BAN_SECONDS}, to=target_sid)
+    # 通知房间其他成员 (成员列表需移除被踢者)
+    for o in list(rooms.get(room, set())):
+        if o != sid and o != target_sid:
+            await sio.emit("server_event",
+                           {"type": "member_kicked", "sid": target_sid, "room": room}, to=o)
+    # 通知房主成功
+    await sio.emit("server_event",
+                   {"type": "kick_ok", "target_sid": target_sid}, to=sid)
+    # 断开被踢者 (disconnect handler 会清 sessions/rooms, 但禁令已写入 _room_kicks)
+    await sio.disconnect(target_sid)
 
 
 @sio.event
@@ -527,7 +679,27 @@ async def new_member_request(sid, _):
         return
     for o in list(rooms.get(me["room"], set())):
         if o != sid:
-            await sio.emit("new_member", {"sid": sid, "epub": me["epub"]}, to=o)
+            await sio.emit("new_member",
+                {"sid": sid, "epub": me["epub"], "id": me.get("id_pub", ""),
+                 "kpub": me.get("kpub", "")}, to=o)
+
+
+@sio.event
+async def kem_ct(sid, payload):
+    """PQ 握手: 封装方把 ML-KEM 密文中继给解封方 (仅限同房)."""
+    me = sessions.get(sid)
+    if not me:
+        return
+    if not isinstance(payload, dict):
+        return
+    target = payload.get("to", "")
+    ct     = payload.get("ct", "")
+    if not target or not ct or len(ct) > 8192:
+        return
+    ts = sessions.get(target)
+    if not ts or ts.get("room") != me["room"]:
+        return
+    await sio.emit("kem_ct", {"from": sid, "ct": ct}, to=target)
 
 
 @sio.event
@@ -761,22 +933,79 @@ async def _app_with_lifespan(scope, receive, send):
 app = _app_with_lifespan
 
 
+def _auto_self_signed_cert() -> tuple[str, str, bytes]:
+    """零交互自签证书引导: 证书不存在即用 cryptography 现场生成,
+    私钥落地 AES-256 加密, 口令 = uuid4, 进程内即用即弃不落盘.
+    返回 (cert_path, key_path, passphrase_bytes)."""
+    import os, secrets, datetime
+    from cryptography import x509 as _cx
+    from cryptography.hazmat.primitives import hashes as _ch
+    from cryptography.hazmat.primitives import serialization as _cs
+    from cryptography.hazmat.primitives.asymmetric import ec as _ce
+    from cryptography.x509.oid import NameOID as _NOID
+
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs")
+    os.makedirs(out_dir, exist_ok=True)
+    cert_path = os.path.join(out_dir, "cert.pem")
+    key_path  = os.path.join(out_dir, "key.pem")
+
+    priv = _ce.generate_private_key(_ce.SECP256R1())
+    sub  = _cx.Name([_cx.NameAttribute(_NOID.COMMON_NAME, "E2EChat-V2 local TLS")])
+    now  = datetime.datetime.now(datetime.timezone.utc)
+    cert = (_cx.CertificateBuilder()
+            .subject_name(sub).issuer_name(sub)
+            .public_key(priv.public_key())
+            .serial_number(_cx.random_serial_number())
+            .not_valid_before(now)
+            .not_valid_after(now + datetime.timedelta(days=365))
+            .add_extension(_cx.SubjectAlternativeName([_cx.DNSName("*")]), critical=False)
+            .sign(priv, _ch.SHA256()))
+
+    pw = bytearray(secrets.token_hex(32).encode("utf-8"))
+    enc_key = priv.private_bytes(
+        encoding=_cs.Encoding.PEM,
+        format=_cs.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=_cs.BestAvailableEncryption(bytes(pw)))
+    with open(cert_path, "wb") as f:
+        f.write(cert.public_bytes(_cs.Encoding.PEM))
+    with open(key_path, "wb") as f:
+        f.write(enc_key)
+    return cert_path, key_path, bytes(pw)
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser(description="E2E-Chat-V2 server")
     ap.add_argument("--host", default=HOST)
     ap.add_argument("--port", type=int, default=PORT)
-    # TLS/WSS 选项: 真实部署需启用, 阻止 ISP 被动监听元数据采集
+    # TLS/WSS 选项: 默认 **开启**. --no-tls 才回退明文 (本地调试用)
+    ap.add_argument("--no-tls", action="store_true",
+                    help="禁用 TLS (明文 ws://, 仅本地调试; 默认开 wss)")
     ap.add_argument("--tls-cert",  default=None,
-                    help="TLS 证书路径 (.pem); 启用后 ws -> wss")
+                    help="TLS 证书路径 (.pem); 不给则自动生成自签证书")
     ap.add_argument("--tls-key",   default=None,
                     help="TLS 私钥路径 (.pem); 与 --tls-cert 配套")
     ap.add_argument("--tls-key-pw", default=None,
                     help="TLS 私钥解密口令 (可省)")
     args = ap.parse_args()
 
-    use_tls = bool(args.tls_cert) and bool(args.tls_key)
-    scheme  = "wss" if use_tls else "ws"
+    use_tls = not args.no_tls
+    tls_pw: bytes | None = None
+
+    if use_tls:
+        cert_file = args.tls_cert
+        key_file  = args.tls_key
+        if cert_file and key_file:
+            # 用户手工指定: 信任其加密体系, 口令从 CLI 来
+            tls_pw = args.tls_key_pw.encode("utf-8") if args.tls_key_pw else None
+        else:
+            # 未指定 → 自动生成自签证书 (零交互, 口令落内存不落盘)
+            cert_file, key_file, tls_pw_bytes = _auto_self_signed_cert()
+            tls_pw = tls_pw_bytes
+        print(f"[e2e-v2] TLS 自签证书就绪: {cert_file}", flush=True)
+        print(f"  [TOFU] 客户端勾 TLS 后留空指纹即可自动钉定首次连接指纹", flush=True)
+
+    scheme = "wss" if use_tls else "ws"
     log.warning("E2E-Chat-V2 starting on %s://%s:%d (hash=%s, tls=%s)",
                 scheme, args.host, args.port, HASH_ALGO, use_tls)
 
@@ -792,10 +1021,10 @@ def main():
                       ws="websockets-sansio",
                       http="h11")
         if use_tls:
-            kwargs["ssl_certfile"] = args.tls_cert
-            kwargs["ssl_keyfile"]  = args.tls_key
-            if args.tls_key_pw:
-                kwargs["ssl_keyfile_password"] = args.tls_key_pw
+            kwargs["ssl_certfile"] = cert_file
+            kwargs["ssl_keyfile"]  = key_file
+            if tls_pw:
+                kwargs["ssl_keyfile_password"] = tls_pw.decode("utf-8")
         uvicorn.run(app, **kwargs)
     except ImportError:
         print("[fallback] uvicorn not installed.", flush=True)

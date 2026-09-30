@@ -50,16 +50,22 @@ namespace E2EChatClient.Crypto
                 throw new CryptographicException(
                     "peer public key rejected (low-order / all-zero / special point)");
 
+            // BUG-3 修复: clamped 私钥副本 k 在函数返回前必须 zeroize,
+            //   否则 32B 私钥留在 GC 堆上, 内存 dump 可读出.
             byte[] k = CopyClamped(myPrivateKey);
-            byte[] shared = ScalarMult(k, peerPublicKey);
+            try {
+                byte[] shared = ScalarMult(k, peerPublicKey);
 
-            // RFC 7748 §6.1: 共享密钥不能为全 0 (all-zero = 攻击者用低阶点逼出的 identity)
-            if (IsAllZero(shared)) {
-                CryptographicOperations.ZeroMemory(shared);
-                throw new CryptographicException(
-                    "shared secret is all-zero (suspected low-order point attack)");
+                // RFC 7748 §6.1: 共享密钥不能为全 0 (all-zero = 攻击者用低阶点逼出的 identity)
+                if (IsAllZero(shared)) {
+                    CryptographicOperations.ZeroMemory(shared);
+                    throw new CryptographicException(
+                        "shared secret is all-zero (suspected low-order point attack)");
+                }
+                return shared;
+            } finally {
+                CryptographicOperations.ZeroMemory(k);
             }
-            return shared;
         }
 
         /// <summary>

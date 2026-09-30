@@ -41,15 +41,19 @@ namespace E2EChatClient.CryptoV2
         }
 
         public static byte[] HashExtended(byte[] input, int outLen) {
+            // BUG-7 修复: outLen > 32 时旧代码用零填充, 不是真正的 BLAKE3 XOF 扩展输出.
+            //   BLAKE3 NuGet 2.2.x 的 Finalize() 只返回 32B; 要 >32B 需用 XOF seek 模式.
+            //   当前项目内无 >32B 调用方, 为安全起见直接拒绝, 防误用产出弱密钥.
+            if (outLen <= 0) return Array.Empty<byte>();
+            if (outLen > 32)
+                throw new ArgumentOutOfRangeException(nameof(outLen),
+                    "HashExtended 当前仅支持 ≤ 32B (BLAKE3 标准 digest). " +
+                    "> 32B 需用 XOF 模式, 请改用 BLAKE3 NuGet 的 Hasher.Finalize(Span<byte>) API.");
             var h = NuBlake3.Hasher.New();
             h.Update(input);
             var hash = h.Finalize();
             byte[] src = hash.AsSpan().ToArray();
-            if (outLen <= 0) return Array.Empty<byte>();
-            if (outLen <= src.Length) return src[..outLen];
-            byte[] big = new byte[outLen];
-            Buffer.BlockCopy(src, 0, big, 0, Math.Min(src.Length, big.Length));
-            return big;
+            return src[..outLen];
         }
 
         public static string HashHex(byte[] input) {

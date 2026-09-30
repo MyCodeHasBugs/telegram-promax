@@ -1,4 +1,4 @@
-// V2 — Signal-style 端对端会话层 (真 Double Ratchet + 重放防御)
+﻿// V2 — Signal-style 端对端会话层 (真 Double Ratchet + 重放防御)
 // 服务器: server_v2.py (BLAKE3 校验, "三不"原则, 无日志文件)
 //
 // 客户端做的事:
@@ -48,6 +48,9 @@ namespace E2EChatClient.Net.V2
         private byte[]? _ephemeralPriv;
         private byte[]? _ephemeralPub;
         private readonly Ed25519Keypair _identityKey;
+        // F5-identity: 外部传入的身份密钥 (持久化) 不由本实例 Dispose,
+        // 只有自生成的 (identityKey==null) 才在 Dispose 时 zeroize.
+        private readonly bool _ownsIdentityKey;
         private readonly string _ephemeralPubB64;
         private readonly string _identityPubB64;
 
@@ -60,6 +63,15 @@ namespace E2EChatClient.Net.V2
         // peerSid -> 当前对端最近一次使用的 DH pub (用于检测 DH 是否轮换)
         private readonly ConcurrentDictionary<string, byte[]> _peerLastDhPub = new();
 
+        // ---- 抗量子 (ML-KEM-1024) ----
+        private readonly MlKemKeyPair _kemKey;               // 我方 PQ 密钥对 (私钥 Dispose 时 zeroize)
+        private readonly string _kemPubB64;                  // 我方 kpub b64, 随 auth/握手分发
+        private readonly ConcurrentDictionary<string, byte[]> _peerKemPubs = new();   // peerSid -> 对端 kpub bytes
+        // peerSid -> 已算出 X25519 共享密钥但还在等对端 kem_ct 的待决状态
+        private readonly ConcurrentDictionary<string, (byte[] epub, byte[] dhShared)> _pendingPq = new();
+        // peerSid -> 在 ratchet 建立前到达的 envelope, 排队等待解密
+        private readonly ConcurrentDictionary<string, List<byte[]>> _pendingEnvelopes = new();
+
         // 分片重组器 + sid_seed -> sender_sid 映射
         private readonly TrafficObfuscator.Reassembler _reassembler = new();
         private readonly ConcurrentDictionary<ulong, string> _sliceSender = new();
@@ -69,11 +81,20 @@ namespace E2EChatClient.Net.V2
         public string Room    { get; private set; } = "";
         public string MyEphemeralPubB64 => _ephemeralPubB64;
         public string MyIdentityPubB64   => _identityPubB64;
+        // F5: 当前会话是否为所在房的房主 (可踢人). 由 auth_response.is_owner 设置.
+        public bool   IsOwner { get; private set; } = false;
 
         public event Action<string, string>? OnMessageReceived;
         public event Action<string>? OnServerEvent;
         public event Action<bool, string>? OnAuthResult;
         public event Action<string, string>? OnNewMember;
+        // F5 踢人相关事件
+        //   OnKicked: 本用户被房主踢出 (reason)
+        //   OnMemberKicked: 房内另一成员被踢 (kickedSid)
+        //   OnKickResult: 本用户发起踢人的结果 (ok, reason)
+        public event Action<string>? OnKicked;
+        public event Action<string>? OnMemberKicked;
+        public event Action<bool, string>? OnKickResult;
 
         // 暴露 SocketIoClient 的 TLS 选项, 透传给 UI/调用方配置
         public bool UseTls
@@ -92,18 +113,53 @@ namespace E2EChatClient.Net.V2
             get => _io.ServerCertSha256;
             set => _io.ServerCertSha256 = value;
         }
+        // TOFU 证书钉定回调: 用户不填指纹时, 首次连接自动记录并提示
+        public FuncTofuCallback? OnTofuCert
+        {
+            get => _ioOnTofuCertProxy;
+            set { _ioOnTofuCertProxy = value; WireTofuCallback(); }
+        }
+        private FuncTofuCallback? _ioOnTofuCertProxy;
+        private void WireTofuCallback()
+        {
+            _io.OnTofuCert -= ForwardTofu;
+            if (_ioOnTofuCertProxy != null)
+                _io.OnTofuCert += ForwardTofu;
+        }
+        private void ForwardTofu(string host, string sha, bool firstSeen)
+            => _ioOnTofuCertProxy?.Invoke(host, sha, firstSeen);
+        public delegate void FuncTofuCallback(string host, string sha256Hex, bool firstSeen);
 
         public ChatSessionV2(string host, int port, Ed25519Keypair? identityKey = null)
         {
             _io = new SocketIoClient(host, port);
-            _identityKey = identityKey ?? Ed25519Keypair.Create();
+            // F5-identity: 外部传入的持久化身份密钥不在 Dispose 时 zeroize (调用方拥有生命周期).
+            //   identityKey==null 时自生成 ephemeral 身份, Dispose 时一并回收.
+            if (identityKey != null) {
+                _identityKey = identityKey;
+                _ownsIdentityKey = false;
+            } else {
+                _identityKey = Ed25519Keypair.Create();
+                _ownsIdentityKey = true;
+            }
             // 握手用 ephemeral X25519, 用完 (session 结束) zeroize
             // 密钥派生依赖系统级 CSPRNG (RandomNumberGenerator -> getrandom/BCryptGenRandom),
             // 严禁使用 MAC 地址/硬盘序列号/时间戳做种子
-            _ephemeralPriv = Curve25519.GeneratePrivateKey();
-            _ephemeralPub  = Curve25519.GeneratePublicKey(_ephemeralPriv);
+            // GPU: cryptolib.dll (CUDA 版) 预生成池有货 → 直接取, 免 CPU 现算
+            var (poolPub, poolPriv) = GpuKeyPool.TryTake();
+            if (poolPub != null && poolPriv != null) {
+                _ephemeralPriv = poolPriv;
+                _ephemeralPub  = poolPub;
+            } else {
+                _ephemeralPriv = Curve25519.GeneratePrivateKey();
+                _ephemeralPub  = Curve25519.GeneratePublicKey(_ephemeralPriv);
+            }
             _ephemeralPubB64 = Convert.ToBase64String(_ephemeralPub);
             _identityPubB64 = Convert.ToBase64String(_identityKey.PublicKey ?? Array.Empty<byte>());
+
+            // 抗量子: 每会话生成一把 ML-KEM-1024 (FIPS 203) 密钥对
+            _kemKey    = MlKemHybrid.GenerateKeyPair();
+            _kemPubB64 = Convert.ToBase64String(_kemKey.PublicKey);
 
             _io.OnEvent += HandleEvent;
             _io.OnAuthResult += (ok, info) =>
@@ -112,6 +168,8 @@ namespace E2EChatClient.Net.V2
                     using var doc = JsonDocument.Parse(info);
                     if (doc.RootElement.TryGetProperty("sid",  out var sEl))  MySid = sEl.GetString() ?? "";
                     if (doc.RootElement.TryGetProperty("room", out var rEl))  Room = rEl.GetString() ?? "";
+                    // F5: 解析 is_owner (create_room 成功或房主重连认领时为 true)
+                    IsOwner = ok && doc.RootElement.TryGetProperty("is_owner", out var ioEl) && ioEl.GetBoolean();
 
                     string hashAlgo = "BLAKE3";
                     if (doc.RootElement.TryGetProperty("hash_algo", out var hEl))
@@ -126,8 +184,9 @@ namespace E2EChatClient.Net.V2
                             string? sid = mem.TryGetProperty("sid",  out var s2) ? s2.GetString() : null;
                             string? pk  = mem.TryGetProperty("epub", out var p2) ? p2.GetString() : null;
                             string? idPub = mem.TryGetProperty("id",   out var id2) ? id2.GetString() : null;
+                            string? kpub = mem.TryGetProperty("kpub", out var k2) ? k2.GetString() : null;
                             if (sid != null && pk != null)
-                                RegisterPeer(sid, pk, idPub);
+                                RegisterPeer(sid, pk, idPub, kpub);
                         }
                     }
                 } catch (Exception ex) { OnServerEvent?.Invoke("auth parse: " + ex.Message); }
@@ -172,6 +231,7 @@ namespace E2EChatClient.Net.V2
             _io.OnAuthResult += oneShot;
 
             // F3-4 房间准入: 若房间有密码, room_password 一并送. 服务端 BLAKE3(password) 比对.
+            // PQ: kpub = ML-KEM-1024 公钥, 随握手分发 (服务端仅透传, 隐私无泄漏)
             _ = _io.EmitAsync("auth", new
             {
                 epub         = _ephemeralPubB64,
@@ -180,6 +240,7 @@ namespace E2EChatClient.Net.V2
                 id_sig       = Convert.ToBase64String(idSig),
                 blake3       = b3,
                 room_password = roomPassword ?? "",
+                kpub         = _kemPubB64,
             });
 
             var winner = await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs));
@@ -220,6 +281,7 @@ namespace E2EChatClient.Net.V2
                 id_sig       = Convert.ToBase64String(idSig),
                 blake3       = b3,
                 room_password = password ?? "",
+                kpub         = _kemPubB64,
             });
 
             var winner = await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs));
@@ -232,24 +294,95 @@ namespace E2EChatClient.Net.V2
         }
 
         /// <summary>
-        /// 注册对端 + 派生棘轮
-        /// 会话层把 ephemeralPriv 注入 ratchet 作 DH 私钥, 与 ephemeralPub 配套.
-        /// F2: peerIdB64 来自服务端 new_member 广播 (服务端已验过 id_sig 与 epub 绑定).
-        ///     本地仅作 TOFU 缓存: 后续消息层 Ed25519 验签必须用相同 id_pub, 否则拒.
+        /// F5: 房主踢出房间内某成员. 服务端校验调用者是否为 owner.
+        /// 结果通过 OnKickResult 事件返回 (非阻塞).
         /// </summary>
-        private void RegisterPeer(string peerSid, string epubB64, string? peerIdB64 = null)
+        public void KickMember(string targetSid)
+        {
+            if (string.IsNullOrEmpty(targetSid)) return;
+            _io.EmitAsync("kick_member", new { target_sid = targetSid });
+        }
+
+        /// <summary>
+        /// 混合导出混合加密种子 — X25519 共享密钥 || ML-KEM shared secret
+        /// 经 HKDF-SHA512 提取+扩展, 得到 32B ratchet 初始种子.
+        /// 任一算法不被攻破, 会话密钥即安全 (单点坍缩防御).
+        /// </summary>
+        private static byte[] CombineShared(byte[] dh, byte[] kemSs)
+        {
+            byte[] ikm = new byte[dh.Length + kemSs.Length];
+            Buffer.BlockCopy(dh, 0, ikm, 0, dh.Length);
+            Buffer.BlockCopy(kemSs, 0, ikm, dh.Length, kemSs.Length);
+            byte[] prk = HkdfSha512.Extract(new byte[64], ikm);
+            byte[] seed = HkdfSha512.Expand(prk, Encoding.UTF8.GetBytes("E2EChat/pq-hybrid-seed"), 32);
+            CryptographicOperations.ZeroMemory(ikm);
+            CryptographicOperations.ZeroMemory(prk);
+            return seed;
+        }
+
+        /// <summary>
+        /// 注册对端 + 派生棘轮 (PQ 混合版).
+        /// 角色分配: epub b64 字典序小的一方作 KEM 封装方 (立即 seed ratchet 并把 kem_ct 发回);
+        ///           另一方为解封方, 持有 X25519 shared 暂存, 等待 kem_ct 到后再建 ratchet.
+        /// 无 kpub 的旧端: 降级为纯 X25519 (打警告事件).
+        /// </summary>
+        private void RegisterPeer(string peerSid, string epubB64, string? peerIdB64 = null, string? peerKpubB64 = null)
         {
             if (_ephemeralPriv == null || _ephemeralPub == null)
                 throw new ObjectDisposedException(nameof(ChatSessionV2));
+
             byte[] epub = Convert.FromBase64String(epubB64);
             _peerPubs[peerSid] = epub;
+            _peerLastDhPub[peerSid] = epub;
             // 先 X25519 校验 (低阶点攻击防御 — 已在 Curve25519 内部强制)
             byte[] shared = Curve25519.ComputeSharedSecret(_ephemeralPriv, epub);
-            var r = new DoubleRatchet(shared, _ephemeralPub, epub);
-            r.SetMyDhPriv(_ephemeralPriv);
-            _ratchets[peerSid] = r;
-            _peerLastDhPub[peerSid] = epub;
-            CryptographicOperations.ZeroMemory(shared);
+
+            // PQ 路径: 对端 kpub 有效 & 我是封装方 → 立即完成握手; 否则进入挂起队列等 kem_ct
+            byte[]? peerKpub = null;
+            if (!string.IsNullOrEmpty(peerKpubB64))
+            {
+                try {
+                    byte[] kb = Convert.FromBase64String(peerKpubB64);
+                    if (kb.Length == MlKemHybrid.PUBLIC_KEY_BYTES) {
+                        peerKpub = kb;
+                        _peerKemPubs[peerSid] = kb;
+                    }
+                } catch (FormatException) { /* 坏 base64 → 视为无 PQ */ }
+            }
+
+            if (peerKpub != null)
+            {
+                bool iAmEncapsulator = string.CompareOrdinal(_ephemeralPubB64, epubB64) < 0;
+                if (iAmEncapsulator)
+                {
+                    (byte[] kemCt, byte[] kemSs) = MlKemHybrid.Encapsulate(peerKpub);
+                    byte[] combined = CombineShared(shared, kemSs);
+                    var r = new DoubleRatchet(combined, _ephemeralPub, epub);
+                    r.SetMyDhPriv(_ephemeralPriv);
+                    _ratchets[peerSid] = r;
+                    CryptographicOperations.ZeroMemory(combined);
+                    CryptographicOperations.ZeroMemory(kemSs);
+                    CryptographicOperations.ZeroMemory(shared);
+                    _io.EmitAsync("kem_ct", new { to = peerSid, ct = Convert.ToBase64String(kemCt) });
+                    OnServerEvent?.Invoke($"[PQ] 已对 {peerSid} 完成 ML-KEM-1024 封装并发 kem_ct");
+                }
+                else
+                {
+                    // 解封方: 暂存 shared (kem_ct 到后再合成), 暂不清除
+                    _pendingPq[peerSid] = (epub, shared);
+                    OnServerEvent?.Invoke($"[PQ] 等待 {peerSid} 的 kem_ct 以完成 ML-KEM 解封...");
+                }
+            }
+            else
+            {
+                // 降级: 对端无 ML-KEM 支持 (旧版客户端). PQ 侧没了就只剩 X25519 — 打显式警告.
+                var r = new DoubleRatchet(shared, _ephemeralPub, epub);
+                r.SetMyDhPriv(_ephemeralPriv);
+                _ratchets[peerSid] = r;
+                CryptographicOperations.ZeroMemory(shared);
+                OnServerEvent?.Invoke($"[PQ↓降级] {peerSid} 不支持 ML-KEM, 降级为纯 X25519 (不抗量子)");
+            }
+
             // F2: 缓存对端 id_pub (TOFU), 后续消息的 Ed25519 验签必须用同一 id_pub
             // F4-2: 已有 id_pub 时不覆盖, 否则 race 下后到的伪 id 会顶掉真 id.
             if (!string.IsNullOrEmpty(peerIdB64)) {
@@ -257,9 +390,7 @@ namespace E2EChatClient.Net.V2
                     byte[] idBytes = Convert.FromBase64String(peerIdB64);
                     if (idBytes.Length == 32)
                         _peerIdPubs.TryAdd(peerSid, idBytes);
-                } catch (FormatException) {
-                    // 坏 base64 不致命: 仅放弃此次预钉, 后续消息层按 TOFU 钉
-                }
+                } catch (FormatException) { /* 坏 base64 不致命 */ }
             }
             OnNewMember?.Invoke(peerSid, epubB64);
         }
@@ -277,6 +408,18 @@ namespace E2EChatClient.Net.V2
             var targets = targetSid == "ALL"
                 ? new List<string>(_peerPubs.Keys)
                 : new List<string> { targetSid };
+
+            // PQ: 若有对端还在等 kem_ct (我是解封方), 最多轮询等待 5s 再放弃
+            foreach (var sid in targets)
+            {
+                if (!_ratchets.ContainsKey(sid) && _pendingPq.ContainsKey(sid))
+                {
+                    for (int i = 0; i < 50 && !_ratchets.ContainsKey(sid); i++)
+                        await Task.Delay(100);
+                    if (!_ratchets.ContainsKey(sid))
+                        OnServerEvent?.Invoke($"[PQ] 等待 {sid} 的 kem_ct 超时, 本次跳过该对端");
+                }
+            }
 
             byte[] plaintext = Encoding.UTF8.GetBytes(text);
 
@@ -313,12 +456,14 @@ namespace E2EChatClient.Net.V2
                 //    (用 BLAKE3 摘要避免长明文签名, 同时复用 BLAKE3 实现)
                 long msgN = ratchet.SendCounter - 1;
                 byte[] myDhPubB64 = Encoding.UTF8.GetBytes(Convert.ToBase64String(ratchet.MyDhPub));
-                byte[] nBe        = BitConverter.GetBytes(System.Net.IPAddress.HostToNetworkOrder((int)msgN));
-                // 拼接 dh_pub_b64 || n_be(4) || cipher 为签名输入
-                byte[] sigInput = new byte[myDhPubB64.Length + 4 + cipher.Length];
+                byte[] nBe        = BitConverter.GetBytes(System.Net.IPAddress.HostToNetworkOrder((long)msgN));
+                // F3 (N2 修复 2026-07-16): sig 覆盖 dh_pub_b64 || n_be(8) || cipher
+                //   原仅拷 nBe 前 4B, big-endian 下低 n 的前 4B 恒为 0 -> 实际 n 脱离 Ed25519 保护,
+                //   比 (int) 截断还退步. 改为完整 8B 覆盖, n 完全入签 (低危 DoS 消除).
+                byte[] sigInput = new byte[myDhPubB64.Length + 8 + cipher.Length];
                 Buffer.BlockCopy(myDhPubB64, 0, sigInput, 0, myDhPubB64.Length);
-                Buffer.BlockCopy(nBe,        0, sigInput, myDhPubB64.Length, 4);
-                Buffer.BlockCopy(cipher,     0, sigInput, myDhPubB64.Length + 4, cipher.Length);
+                Buffer.BlockCopy(nBe,        0, sigInput, myDhPubB64.Length, 8);
+                Buffer.BlockCopy(cipher,     0, sigInput, myDhPubB64.Length + 8, cipher.Length);
                 byte[] sig = _identityKey.Sign(sigInput);
                 CryptographicOperations.ZeroMemory(sigInput);
 
@@ -365,10 +510,87 @@ namespace E2EChatClient.Net.V2
                 case "chat_slice":    HandleChatSlice(payload); break;
                 case "chat_message":  HandleChatMessage(payload); break;
                 case "new_member":    HandleNewMember(payload); break;
-                case "server_event":  OnServerEvent?.Invoke(payload.GetRawText()); break;
+                case "kem_ct":        HandleKemCt(payload); break;   // PQ: 对端的 ML-KEM 密文
+                case "server_event":  HandleServerEvent(payload); break;
                 case "room_list":     HandleRoomList(payload); break;
                 case "typing":        break;
                 case "online_list":   break;
+            }
+        }
+
+        /// <summary>
+        /// PQ: 对端 (封装方) 发来的 ML-KEM 密文到达.
+        /// 我方是解封方: Decapsulate 得 shared, 与之前暂存的 X25519 dh 混合, 建 ratchet,
+        /// 然后把挂在该 sid 下等待解密的 envelope 全部处理掉.
+        /// </summary>
+        private void HandleKemCt(JsonElement payload)
+        {
+            try
+            {
+                string? from = payload.TryGetProperty("from", out var f) ? f.GetString() : null;
+                string? ctB64 = payload.TryGetProperty("ct", out var c) ? c.GetString() : null;
+                if (from == null || ctB64 == null) return;
+
+                if (!_pendingPq.TryRemove(from, out var pend))
+                {
+                    OnServerEvent?.Invoke($"[PQ] 收到 {from} 的 kem_ct 但握手已关闭/重复, 忽略");
+                    return;
+                }
+                if (_ephemeralPub == null) return;
+
+                byte[] kemCt;
+                try { kemCt = Convert.FromBase64String(ctB64); }
+                catch { OnServerEvent?.Invoke($"[PQ] {from} kem_ct base64 无效"); return; }
+
+                byte[] kemSs = MlKemHybrid.Decapsulate(_kemKey.PrivateKey, kemCt);
+                byte[] combined = CombineShared(pend.dhShared, kemSs);
+                var r = new DoubleRatchet(combined, _ephemeralPub, pend.epub);
+                r.SetMyDhPriv(_ephemeralPriv!);
+                _ratchets[from] = r;
+                CryptographicOperations.ZeroMemory(combined);
+                CryptographicOperations.ZeroMemory(kemSs);
+                CryptographicOperations.ZeroMemory(pend.dhShared);
+
+                OnServerEvent?.Invoke($"[PQ] 与 {from} 完成 X25519+ML-KEM-1024 混合握手");
+
+                // 排空等待解密的消息
+                if (_pendingEnvelopes.TryRemove(from, out var queued))
+                {
+                    foreach (var env in queued)
+                        ProcessEnvelope(from, env);
+                }
+            }
+            catch (Exception ex)
+            {
+                OnServerEvent?.Invoke("[PQ] kem_ct 处理异常: " + ex.Message);
+            }
+        }
+
+        // F5: 解析 server_event.type, 踢人相关事件路由到专用回调,
+        //     其余仍走 OnServerEvent (保持向后兼容).
+        private void HandleServerEvent(JsonElement payload)
+        {
+            string type = payload.TryGetProperty("type", out var t) ? t.GetString() ?? "" : "";
+            switch (type)
+            {
+                case "kicked":
+                    string kickReason = payload.TryGetProperty("reason", out var r) ? r.GetString() ?? "" : "";
+                    OnKicked?.Invoke(kickReason);
+                    return;
+                case "member_kicked":
+                    string kickedSid = payload.TryGetProperty("sid", out var s) ? s.GetString() ?? "" : "";
+                    OnMemberKicked?.Invoke(kickedSid);
+                    return;
+                case "kick_ok":
+                    OnKickResult?.Invoke(true, "");
+                    return;
+                case "kick_denied":
+                    string denyReason = payload.TryGetProperty("reason", out var rd) ? rd.GetString() ?? "" : "";
+                    OnKickResult?.Invoke(false, denyReason);
+                    return;
+                default:
+                    OnServerEvent?.Invoke(payload.GetRawText());
+                    return;
             }
         }
 
@@ -493,7 +715,16 @@ namespace E2EChatClient.Net.V2
                     }
                     if (!_ratchets.TryGetValue(fromSid, out _)) return;
                 }
-                if (!_ratchets.TryGetValue(fromSid, out var ratchet)) return;
+                // PQ 握手未完成 (等 kem_ct): 信封暂存, 等 HandleKemCt 排空
+                if (!_ratchets.TryGetValue(fromSid, out var ratchet))
+                {
+                    if (_pendingPq.ContainsKey(fromSid))
+                    {
+                        var q = _pendingEnvelopes.GetOrAdd(fromSid, _ => new List<byte[]>());
+                        if (q.Count < 200) q.Add(envBytes);
+                    }
+                    return;
+                }
                 epubBytes = _peerPubs[fromSid];
 
                 // 4) 双棘轮 TryRecv: 重放 / DH 校验 / n 校验
@@ -510,15 +741,16 @@ namespace E2EChatClient.Net.V2
                     return;
                 }
 
-                // 5) F3: Ed25519 验签, sig 覆盖 dh_pub_b64 || n_be(4) || cipher,
-                //    防 MITM 改 envelope.dh_pub 让 ratchet 失同步
+                // 5) F3: Ed25519 验签, sig 覆盖 dh_pub_b64 || n_be(8) || cipher,
+                //    防 MITM 改 envelope.dh_pub 或 n 让 ratchet 失同步
                 {
                     byte[] dhPubB64Bytes = Encoding.UTF8.GetBytes(dhPubB64!);
-                    byte[] nBe = BitConverter.GetBytes(System.Net.IPAddress.HostToNetworkOrder((int)n));
-                    byte[] sigInput = new byte[dhPubB64Bytes.Length + 4 + cipher.Length];
+                    byte[] nBe = BitConverter.GetBytes(System.Net.IPAddress.HostToNetworkOrder((long)n));
+                    // N2 修复: 完整 8B big-endian n 入签, 与发送侧对称
+                    byte[] sigInput = new byte[dhPubB64Bytes.Length + 8 + cipher.Length];
                     Buffer.BlockCopy(dhPubB64Bytes, 0, sigInput, 0, dhPubB64Bytes.Length);
-                    Buffer.BlockCopy(nBe,         0, sigInput, dhPubB64Bytes.Length, 4);
-                    Buffer.BlockCopy(cipher,       0, sigInput, dhPubB64Bytes.Length + 4, cipher.Length);
+                    Buffer.BlockCopy(nBe,         0, sigInput, dhPubB64Bytes.Length, 8);
+                    Buffer.BlockCopy(cipher,       0, sigInput, dhPubB64Bytes.Length + 8, cipher.Length);
                     bool sigOk = Ed25519Keypair.Verify(idPubBytes, sigInput, sig);
                     CryptographicOperations.ZeroMemory(sigInput);
                     if (!sigOk)
@@ -562,11 +794,13 @@ namespace E2EChatClient.Net.V2
                     return;
                 }
 
-                // 更新对端最近 DH pub (用于发送侧检测我方是否需要跟着轮换)
-                if (!_peerLastDhPub.TryGetValue(fromSid, out var lastDh)
-                    || !BytesEqual(lastDh, theirDhPub)) {
-                    _peerLastDhPub[fromSid] = (byte[])theirDhPub.Clone();
-                }
+                // BUG-1 修复: 不在此处更新 _peerLastDhPub!
+                //   _peerLastDhPub 表示"我方上次发送时对端的 DH pub", 只应在
+                //   SendMessageAsync 的 DhRatchetForSend 之后更新. 若 TryRecv 后
+                //   也同步更新, 则 _peerLastDhPub == ratchet.PeerDhPub 恒成立,
+                //   SendMessageAsync 的 DH 轮换检测永远不触发, DhRatchetForSend
+                //   永远不被调用 -> Double Ratchet 退化为对称棘轮.
+                //   ratchet.PeerDhPub 已在 TryRecv 内部切换, 发送侧检测时读它即可.
 
                 // 5) 解密
                 byte[] msgKey = outcome.MessageKey!;
@@ -665,14 +899,14 @@ namespace E2EChatClient.Net.V2
                     return;
                 }
 
-                // F3: sig 覆盖 dh_pub_b64 || n_be(4) || cipher
+                // F3: sig 覆盖 dh_pub_b64 || n_be(8) || cipher   (N2 修复: 4B→8B 完整覆盖)
                 {
                     byte[] dhPubB64Bytes = Encoding.UTF8.GetBytes(dhPubB64!);
-                    byte[] nBe = BitConverter.GetBytes(System.Net.IPAddress.HostToNetworkOrder((int)n));
-                    byte[] sigInput = new byte[dhPubB64Bytes.Length + 4 + cipher.Length];
+                    byte[] nBe = BitConverter.GetBytes(System.Net.IPAddress.HostToNetworkOrder((long)n));
+                    byte[] sigInput = new byte[dhPubB64Bytes.Length + 8 + cipher.Length];
                     Buffer.BlockCopy(dhPubB64Bytes, 0, sigInput, 0, dhPubB64Bytes.Length);
-                    Buffer.BlockCopy(nBe,         0, sigInput, dhPubB64Bytes.Length, 4);
-                    Buffer.BlockCopy(cipher,       0, sigInput, dhPubB64Bytes.Length + 4, cipher.Length);
+                    Buffer.BlockCopy(nBe,         0, sigInput, dhPubB64Bytes.Length, 8);
+                    Buffer.BlockCopy(cipher,       0, sigInput, dhPubB64Bytes.Length + 8, cipher.Length);
                     bool sigOk = Ed25519Keypair.Verify(idPubBytes, sigInput, sig);
                     CryptographicOperations.ZeroMemory(sigInput);
                     if (!sigOk) {
@@ -704,10 +938,7 @@ namespace E2EChatClient.Net.V2
                     OnServerEvent?.Invoke($"[{desc}] n={n} from={fromSid} ({outcome.Reason})");
                     return;
                 }
-                if (!_peerLastDhPub.TryGetValue(fromSid, out var lastDh)
-                    || !BytesEqual(lastDh, theirDhPub)) {
-                    _peerLastDhPub[fromSid] = (byte[])theirDhPub.Clone();
-                }
+                // BUG-1 修复: 不在此处更新 _peerLastDhPub (同 ProcessEnvelope)
 
                 byte[] msgKey = outcome.MessageKey!;
                 byte[] pt;
@@ -730,8 +961,9 @@ namespace E2EChatClient.Net.V2
             string? sid    = payload.TryGetProperty("sid",  out var s)  ? s.GetString()  : null;
             string? pk     = payload.TryGetProperty("epub", out var p) ? p.GetString()  : null;
             string? idPub  = payload.TryGetProperty("id",   out var i) ? i.GetString()  : null;
+            string? kpub   = payload.TryGetProperty("kpub", out var k) ? k.GetString()  : null;
             if (sid == null || pk == null) return;
-            if (!_peerPubs.ContainsKey(sid)) RegisterPeer(sid, pk, idPub);
+            if (!_peerPubs.ContainsKey(sid)) RegisterPeer(sid, pk, idPub, kpub);
             else OnNewMember?.Invoke(sid, pk);
         }
 
@@ -755,7 +987,16 @@ namespace E2EChatClient.Net.V2
             _peerIdPubs.Clear();
             _peerLastDhPub.Clear();
             _sliceSender.Clear();
-            _identityKey.Dispose();
+            // PQ: 清理 KEM 私钥 + 所有挂起的 X25519 共享密钥
+            _kemKey.Dispose();
+            foreach (var kv in _pendingPq) CryptographicOperations.ZeroMemory(kv.Value.dhShared);
+            _pendingPq.Clear();
+            _pendingEnvelopes.Clear();
+            // F5-identity: 仅自生成的身份密钥才 Dispose (zeroize);
+            // 外部传入的持久化身份由调用方 (MainWindow) 管理生命周期.
+            if (_ownsIdentityKey) {
+                _identityKey.Dispose();
+            }
             // zeroize 原地, 然后置 null 防 dump
             // (readonly 阻止置 null, 故字段不再是 readonly)
             if (_ephemeralPriv != null) {

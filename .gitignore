@@ -39,3 +39,14 @@ server_err.txt
 kicks.log
 
 # Local work wip (kept in mind in head)
+.tmp_review/
+
+# 编译产物，不入库
+installer/bin/
+installer/obj/
+**/bin/
+**/obj/
+*.exe
+*.dll
+*.pdb
+installer/Payload/*.zip

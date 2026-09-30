@@ -38,7 +38,10 @@ namespace E2EChatClient.Net
         // 允许自签证书 — 默认 **false** (严格指纹锁)
         // 开发期 / 内网部署 设置 AllowSelfSigned=true 才接受任意自签证书
         public bool AllowSelfSigned { get; set; } = false;
-        public string? ServerCertSha256 { get; set; } // hex, 可选校验指纹
+        public string? ServerCertSha256 { get; set; } // hex, 可选校验指纹 (显式钉定)
+
+        // TOFU: 未显式钉指纹时回调. 返回 true 接受; 首个到的指纹会被持久化 + 提示
+        public event Action<string, string, bool>? OnTofuCert; // host, sha256hex, isFirstSeen
 
         public event Action<string, JsonElement>? OnEvent;
         public event Action<string>? OnError;
@@ -51,8 +54,8 @@ namespace E2EChatClient.Net
         private Task? _recvTask;
         private Task? _pingTask;
 
-        // ack id 映射
-        private static int _nextAck = 1;
+        // BUG-15 修复: _nextAck 从 static 改为实例字段, 避免多实例共享 ack id 冲突
+        private int _nextAck = 1;
         private readonly ConcurrentDictionary<int, TaskCompletionSource<JsonElement>> _acks =
             new();
 
@@ -72,6 +75,17 @@ namespace E2EChatClient.Net
 
         public async Task ConnectAsync()
         {
+            // BUG-9 修复: ClientWebSocket 一旦连接过 (状态非 None) 就不能重用,
+            //   否则 ConnectAsync 抛 InvalidOperationException.
+            //   重连场景: Dispose 旧 _ws + _cts, 重建新实例.
+            if (_ws.State != WebSocketState.None)
+            {
+                try { _ws.Dispose(); } catch { }
+                _ws = new ClientWebSocket();
+                try { _cts.Dispose(); } catch { }
+                _cts = new CancellationTokenSource();
+            }
+
             string scheme = UseTls ? "wss" : "ws";
             var url = new Uri($"{scheme}://{ServerHost}:{ServerPort}{_sidPath}");
 
@@ -80,17 +94,32 @@ namespace E2EChatClient.Net
 
             // TLS: 配置 RemoteCertificateValidationCallback
             // - AllowSelfSigned=true: 接受任意自签 (开发期 / 内网部署)
-            // - AllowSelfSigned=false + ServerCertSha256: 严格指纹校验 (队形 pin)
+            // - ServerCertSha256 填了: 严格指纹钉定 (用户手动填的优先)
+            // - 默认(空指纹):      TOFU — 首次连接记指纹, 指纹变了直接拒
             if (UseTls) {
                 _ws.Options.RemoteCertificateValidationCallback = (sender, cert, chain, sslPolicyErrors) => {
                     if (cert == null) return false;
-                    if (AllowSelfSigned) return true;
-                    if (string.IsNullOrEmpty(ServerCertSha256) || cert == null) return false;
-                    // 计算 DER SHA256
+                    // 计算 DER SHA256 指纹
                     using var sha = System.Security.Cryptography.SHA256.Create();
                     byte[] der = cert.Export(System.Security.Cryptography.X509Certificates.X509ContentType.Cert);
                     string hashHex = BitConverter.ToString(sha.ComputeHash(der)).Replace("-", "").ToLowerInvariant();
-                    return hashHex == ServerCertSha256;
+
+                    // 1) 用户手动钉的指纹 (严格, 不 TOFU)
+                    if (!string.IsNullOrEmpty(ServerCertSha256))
+                        return hashHex == ServerCertSha256;
+
+                    if (AllowSelfSigned) return true;
+
+                    // 2) TOFU 模式
+                    string? pinned = CertPinStore.Get(ServerHost, ServerPort);
+                    if (pinned != null) {
+                        // 已记录: 必须一致, 变了 = 有人在中间捣鬼
+                        return string.Equals(pinned, hashHex, StringComparison.OrdinalIgnoreCase);
+                    }
+                    // 首个到者, 记录下来并放行
+                    CertPinStore.Pin(ServerHost, ServerPort, hashHex);
+                    OnTofuCert?.Invoke(ServerHost, hashHex, true);
+                    return true;
                 };
             }
 
@@ -292,13 +321,20 @@ namespace E2EChatClient.Net
             try
             {
                 using var doc = JsonDocument.Parse(rest.Substring(i));
-                if (doc.RootElement.ValueKind == JsonValueKind.Array &&
-                    doc.RootElement.EnumerateArray().MoveNext())
+                // BUG-5 修复: 不能两次调用 EnumerateArray() (每次返回新 enumerator).
+                //   原 code: if (...EnumerateArray().MoveNext()) { var first = ...EnumerateArray().Current; }
+                //   第二次 Current 在未 MoveNext 的新 enumerator 上 -> InvalidOperationException.
+                //   修复: 用同一 enumerator.
+                if (doc.RootElement.ValueKind == JsonValueKind.Array)
                 {
-                    var first = doc.RootElement.EnumerateArray().Current;
-                    tcs.TrySetResult(first);
+                    var en = doc.RootElement.EnumerateArray();
+                    if (en.MoveNext())
+                        tcs.TrySetResult(en.Current);
+                    else
+                        tcs.TrySetResult(default);
                 }
-                else tcs.TrySetResult(default);
+                else
+                    tcs.TrySetResult(default);
             }
             catch (Exception ex) { tcs.TrySetException(ex); }
         }

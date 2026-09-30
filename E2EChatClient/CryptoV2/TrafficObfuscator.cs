@@ -157,7 +157,9 @@ public static class TrafficObfuscator
 
             byte[] result = new byte[origLen];
             Buffer.BlockCopy(full, 4, result, 0, (int)origLen);
-            CryptographicOperations.ZeroMemory(full.AsSpan(0, Math.Min(4, full.Length)));
+            // BUG-11 修复: 旧代码只清前 4B (length header), ciphertext 主体未清.
+            //   修复: 清整个 full (含 4B header + ciphertext).
+            CryptographicOperations.ZeroMemory(full.AsSpan());
             return result;
         }
 

@@ -1,79 +1,45 @@
-name: Build CryptoLib.dll with CUDA  (DISABLED — F4-4)
-
-# ====================================================================
-# Pass4-F4-4 修复说明
-# --------------------------------------------------------------------
-# 历史: 本 workflow 在 `push` 触发下自动编译 cryptolib/*.cu/*.cpp 出
-# CryptoLib.dll, 而 ecc_kernel.cu 当时是 pub^=0x5A 占位、cryptolib.cpp
-# 的 hybrid_* 返回 ERROR:not_implemented — 产出一个 "能编但不能用" 的
-# 半成品 DLL, via CryptoLibBridge.IsDllAvailable() 误判可用, 安全属性
-# 清零. 这是典型脚枪 (Pass3-F3-7 + Pass4-F4-4).
-#
-# 当前措施:
-#   1. ecc_kernel.cu / cryptolib.cpp 已加 #error 硬失败, 占位路径不再
-#      能编出 DLL. 即便误跑本 workflow, 编译会直接断, 不会有产物上传.
-#   2. 本 workflow 也只保留 workflow_dispatch (手动触发), 不再 push 自动跑.
-#   3. V2 客户端主链路完全不依赖 CryptoLib.dll; CryptoLibBridge 仅为 UI
-#      信息展示. 真要恢复 GPU 路径: 先补 5×52 limb X25519 + 完整 hybrid_*,
-#      再去掉 cryptolib 里两处 #error, 然后手动 run workflow 验证.
-# ====================================================================
+name: Build E2EChatClient
 
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
-    inputs:
-      cuda_version:
-        description: 'CUDA Toolkit version'
-        required: true
-        default: '12.4.1'
-
-# 注意: 已经移除 push trigger, 占位代码不会被自动编进任何 DLL.
-# (历史上 push paths 下 *.cu/*.cpp/*.h/*.yml 即跑; 现删之.)
 
 jobs:
-  build:
+  build-debug:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+    - uses: actions/checkout@v4
+    - uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '10.0.x'
+    - run: dotnet restore E2EChatClient/E2EChatClient.csproj
+    - run: |
+        dotnet publish E2EChatClient/E2EChatClient.csproj `
+          -c Debug -r win-x64 --self-contained true `
+          -p:PublishSingleFile=true -o ./publish
+    - uses: actions/upload-artifact@v4
+      with:
+        name: E2EChatClient
+        path: ./publish/**
 
-      - name: Sanity gate — reject placeholder compilation
-        run: |
-          Write-Host "::error::ecc_kernel.cu/cryptolib.cpp 仍含 #error 占位闸," +
-                     "本 workflow 不应产出任何 DLL. 如确需恢复 GPU 路径, " +
-                     "请先补完整 5x52 limb X25519 与 hybrid_* 实现."
-          exit 1
-        shell: pwsh
-
-      # 下面步骤保留以备将来真实实现就位后恢复 (当前因上一 step exit 1 不会执行)
-
-      - name: Install CUDA Toolkit (disabled)
-        if: false
-        uses: JimVer/cuda-toolkit@v0.2.20
-        with:
-          cuda: ${{ github.event.inputs.cuda_version || '12.4.1' }}
-          method: 'network'
-          sub-packages: '["nvcc","cudart","dev"]'
-
-      - name: Set up MSVC dev prompt (disabled)
-        if: false
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      - name: Build DLL (disabled)
-        if: false
-        run: |
-          cd cryptolib
-          nvcc -O2 -shared -Xcompiler "/MD" `
-               -o CryptoLib.dll `
-               ecc_kernel.cu `
-               cryptolib.cpp `
-               -lcudart
-        shell: pwsh
-
-      - name: Upload DLL artifact (disabled)
-        if: false
-        uses: actions/upload-artifact@v4
-        with:
-          name: CryptoLib-windows-x64
-          path: cryptolib/CryptoLib.dll
-          retention-days: 30
+  create-release:
+    needs: build-debug
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        name: E2EChatClient
+        path: ./release-files
+    - run: |
+        cd release-files
+        zip -r ../E2EChatClient-${{ github.ref_name }}.zip .
+    - uses: softprops/action-gh-release@v1
+      with:
+        files: E2EChatClient-${{ github.ref_name }}.zip
+        generate_release_notes: true
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,5 +1,6 @@
 using System;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
@@ -21,18 +22,165 @@ namespace E2EChatClient.UI
     {
         private ChatSessionV2? _session;
         private string _myName = "";
+        // F5-identity: 持久化 Ed25519 身份密钥, 跨重连/重启稳定.
+        //   id_pub 作为踢人禁令键和房主认领键的前提: 必须每次连接用同一身份.
+        //   启动时从 %LOCALAPPDATA%/E2EChatClient/identity.key 加载 (不存在则生成落盘).
+        private readonly Ed25519Keypair _identityKey;
 
         public MainWindow()
         {
             InitializeComponent();
 
+            // GL 玻璃背景失败 → 切 CPU 动画兜底 (RDP/老机/驱动不支持时)
+            GlassBg.Failed += () => Dispatcher.BeginInvoke(() =>
+            {
+                GlassBg.Visibility = Visibility.Collapsed;
+                GlassFallback.Visibility = Visibility.Visible;
+                PushEvent("[UI] GL 玻璃不可用, 已切换 WPF 动画背景");
+            });
+
+            // F5-identity: 加载持久化身份 (id_pub 跨重连稳定, 是踢人禁令+房主认领的前提)
+            _identityKey = IdentityStore.LoadOrCreate();
+            string idFp = FullFingerprintHex(Convert.ToBase64String(_identityKey.PublicKey ?? Array.Empty<byte>()));
+            PushEvent("[身份] Ed25519 长期身份已加载, id_pub 指纹=" + (idFp.Length >= 16 ? idFp[..16] + "…" : idFp));
+
             // GPU/DLL 探测保留 (与 V2 加密主链路无关, 仅信息展示)
             string gpu = CryptoLibBridge.IsGpuAvailable() ? "GPU 可用" : "GPU 未启用 (CPU 后备)";
             PushEvent("[启动] " + gpu);
+            // GPU 密钥池: CUDA DLL 就绪时后台预生成 32 把 X25519 会话密钥
+            if (GpuKeyPool.IsGpuBacked) {
+                GpuKeyPool.TryFillAsync();
+                PushEvent("[启动] GPU 密钥池后台填充中 (32 把 X25519/次)");
+            }
             PushEvent("[启动] DLL: " + (CryptoLibBridge.IsDllAvailable()
                 ? "CryptoLib.dll 已加载"
                 : "CryptoLib.dll 缺失 — 走 C# 内置 Cipher"));
-            PushEvent("[V2] X25519 + XChaCha20-Poly1305 + BLAKE3 + Ed25519 + DoubleRatchet");
+            PushEvent("[V2] X25519 + ML-KEM-1024 (抗量子混合握手) + XChaCha20-Poly1305 + BLAKE3 + Ed25519 + DoubleRatchet");
+        }
+
+        // ============================================================
+        //  液态玻璃: 按系统版本自动选择 — Win11 Mica / Win10 Acrylic / 更老直接纯色
+        // ============================================================
+        private static class NativeGlass
+        {
+            [DllImport("dwmapi.dll", PreserveSig = true)]
+            public static extern int DwmSetWindowAttribute(
+                IntPtr hwnd, int dwAttribute, ref int pvAttribute, int cbAttribute);
+
+            [DllImport("user32.dll")]
+            public static extern int SetWindowCompositionAttribute(
+                IntPtr hwnd, ref WINDOWCOMPOSITIONATTRIBDATA data);
+
+            [DllImport("ntdll.dll")]
+            public static extern int RtlGetVersion(ref OSVERSIONINFOEX os);
+
+            [StructLayout(LayoutKind.Sequential)]
+            public struct OSVERSIONINFOEX
+            {
+                public uint dwOSVersionInfoSize;
+                public uint dwMajorVersion;
+                public uint dwMinorVersion;
+                public uint dwBuildNumber;
+                public uint dwPlatformId;
+                [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+                public string szCSDVersion;
+                public ushort wServicePackMajor;
+                public ushort wServicePackMinor;
+                public ushort wSuiteMask;
+                public byte wProductType;
+                public byte wReserved;
+            }
+
+            // user32 SetWindowCompositionAttribute 用的结构
+            [StructLayout(LayoutKind.Sequential)]
+            public struct AccentPolicy
+            {
+                public int AccentState;   // 0=关闭 1=渐变 2=透明渐变 3=模糊(老) 4=亚克力模糊
+                public int AccentFlags;   // 0=默认
+                public uint GradientColor; // ABGR
+                public int AnimationId;
+            }
+
+            [StructLayout(LayoutKind.Sequential)]
+            public struct WINDOWCOMPOSITIONATTRIBDATA
+            {
+                public int Attribute;   // 19 = WCA_ACCENT_POLICY
+                public IntPtr Data;
+                public int SizeOfData;
+            }
+        }
+
+        protected override void OnSourceInitialized(EventArgs e)
+        {
+            base.OnSourceInitialized(e);
+            ApplyLiquidGlass();
+        }
+
+        private void ApplyLiquidGlass()
+        {
+            try
+            {
+                IntPtr hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+                if (hwnd == IntPtr.Zero) return;
+
+                // 深色标题栏 (Win10 1809+/Win11 都支持)
+                int dark = 1;
+                NativeGlass.DwmSetWindowAttribute(hwnd, 20, ref dark, sizeof(int));
+
+                // 判定系统: Win11 = Major 10 Build >= 22000
+                var os = new NativeGlass.OSVERSIONINFOEX {
+                    dwOSVersionInfoSize = (uint)Marshal.SizeOf<NativeGlass.OSVERSIONINFOEX>()
+                };
+                NativeGlass.RtlGetVersion(ref os);
+                bool isWin11 = os.dwMajorVersion == 10 && os.dwBuildNumber >= 22000;
+
+                if (isWin11)
+                {
+                    // Win11: Mica 系统背景 (DWMWA_SYSTEMBACKDROP_TYPE = 38, 2 = Mica)
+                    int backdrop = 2;
+                    NativeGlass.DwmSetWindowAttribute(hwnd, 38, ref backdrop, sizeof(int));
+                    PushEvent("[UI] 液态玻璃: Mica 模式 (Win11)");
+                }
+                else
+                {
+                    // Win10: ACCENT_ENABLE_ACRYLICBLURBEHIND (亚克力模糊), Win10 1809+
+                    // 暗色调调色, ABGR = AA BB GG RR (小端内存为反序)
+                    NativeGlass.AccentPolicy acc = new()
+                    {
+                        AccentState    = 4,                     // ACCENT_ENABLE_ACRYLICBLURBEHIND
+                        AccentFlags    = 0,
+                        GradientColor  = 0x66_0A_10_14,         // 微透暗黑 (Win10 亚克力玻璃)
+                        AnimationId    = 0,
+                    };
+                    IntPtr policyPtr = Marshal.AllocHGlobal(Marshal.SizeOf(acc));
+                    try
+                    {
+                        Marshal.StructureToPtr(acc, policyPtr, false);
+                        var data = new NativeGlass.WINDOWCOMPOSITIONATTRIBDATA
+                        {
+                            Attribute  = 19,    // WCA_ACCENT_POLICY
+                            Data       = policyPtr,
+                            SizeOfData = Marshal.SizeOf(acc),
+                        };
+                        NativeGlass.SetWindowCompositionAttribute(hwnd, ref data);
+                        // 亚克力需要半透明底才能透出来
+                        if (Background is SolidColorBrush)
+                        {
+                            Background = new SolidColorBrush(Color.FromArgb(0xE0, 0x0B, 0x0F, 0x1A));
+                        }
+                        PushEvent("[UI] 液态玻璃: Acrylic 模式 (Win10)");
+                    }
+                    finally
+                    {
+                        Marshal.FreeHGlobal(policyPtr);
+                    }
+                }
+            }
+            catch
+            {
+                // 老系统/DWM 失效 → 仅保留 XAML 渐变玻璃卡
+                PushEvent("[UI] 液态玻璃: 纯色玻璃 (系统 DWM 不可用)");
+            }
         }
 
         private async void ConnBtn_Click(object sender, RoutedEventArgs e)
@@ -49,11 +197,16 @@ namespace E2EChatClient.UI
                 ConnStatus.Text = "● 已断开";
                 ConnStatus.Foreground = (SolidColorBrush)new BrushConverter().ConvertFrom("#f38ba8");
                 MembersList.Items.Clear();
+                KickBtn.IsEnabled = false;
                 return;
             }
 
             string host = HostBox.Text.Trim();
-            int port = int.Parse(PortBox.Text.Trim());
+            // BUG-10 修复: int.Parse 未捕获 FormatException, 改用 TryParse
+            if (!int.TryParse(PortBox.Text.Trim(), out int port) || port < 1 || port > 65535) {
+                MessageBox.Show("端口必须是 1-65535 的数字", "端口无效");
+                return;
+            }
             string name = NameBox.Text.Trim();
             string room = RoomBox.Text.Trim();
 
@@ -79,44 +232,28 @@ namespace E2EChatClient.UI
                 }
             }
 
-            _session = new ChatSessionV2(host, port);
-            // F1: 严格 TLS. 勾选 TLS 必须填指纹, 否则视为配置失败的拒绝连接.
-            // 之前 GUI 勾 TLS 即 AllowSelfSigned=true = "加密但不认证", 任意中间人亮自签即可 MITM.
-            if (TlsBox.IsChecked == true) {
-                string fp = CertShaBox.Text.Trim().ToLowerInvariant();
-                if (string.IsNullOrEmpty(fp)) {
-                    System.Windows.MessageBox.Show(
-                        "开启 TLS 必须填服务器证书 SHA256 指纹 (gen_self_signed_cert.py 会打印).\n" +
-                        "拒绝以'信任任意证书'模式连接, 防止 MITM.",
-                        "TLS 指纹缺失",
-                        System.Windows.MessageBoxButton.OK,
-                        System.Windows.MessageBoxImage.Warning);
-                    return;
-                }
-                _session.UseTls = true;
-                _session.AllowSelfSigned = false;       // 强制指纹锁
-                _session.ServerCertSha256 = fp;
-            } else {
-                // 头号 🔴 修复 (2026-07-15): 默认 ws:// 明文 = auth.epub/成员关系/消息外壳全裸奔.
-                // 不动协议默认 (保留内网联调友好), 但每次明文连接强制 informed consent:
-                // 用户必须主动确认"我了解网络风险"才会继续, 防误用默认值进入不安全通道.
-                var mbResult = System.Windows.MessageBox.Show(
-                    "⚠ 你将以 **明文 ws://** 连接服务器.\n\n" +
-                    "风险: auth.epub、成员关系、消息外壳在网络链路上全裸奔. 任何在链路上的" +
-                    "人 (ISP/同 Wi-Fi/企业代理) 可被动读取; 主动 MITM 可在不破任何密钥的情况下\n" +
-                    "读改写全部所谓端到端消息 (Pass2-F2).\n\n" +
-                    "推荐: 取消本弹窗 → 勾选 TLS → 把 gen_self_signed_cert.py 打印的指纹粘进指纹框.\n\n" +
-                    "我只在内网联调或已知安全网络下使用明文, 确认继续?",
-                    "明文连接风险确认",
-                    System.Windows.MessageBoxButton.YesNo,
-                    System.Windows.MessageBoxImage.Warning,
-                    System.Windows.MessageBoxResult.No);
-                if (mbResult != System.Windows.MessageBoxResult.Yes) {
-                    _session.Dispose();
-                    _session = null;
-                    return;
-                }
-                PushEvent("[⚠] 已确认明文连接风险 (Pass2-F2: 默认 ws:// 不防 MITM)");
+            // 傻瓜式 TLS: 永远勾着, 用户不用懂指纹. 第一次连接自动钉 (TOFU);
+            // 之后指纹对不上即拒, 防 MITM. 失败时提示用户可改明文重试.
+            bool usePlaintext = false;
+
+retry_connect:
+            _session = new ChatSessionV2(host, port, _identityKey);
+            _session.UseTls = !usePlaintext;
+            _session.AllowSelfSigned = false;
+            _session.ServerCertSha256 = null;   // TOFU 模式
+
+            _session.OnTofuCert = (h, sha, firstSeen) => Dispatcher.BeginInvoke(() =>
+            {
+                if (firstSeen)
+                    PushEvent($"[TLS/TOFU] 首次见到 {h} 的证书指纹: {sha[..12]}… 已自动钉定");
+                else
+                    PushEvent($"[TLS] 证书指纹吻合: {sha[..12]}…");
+            });
+
+            if (!usePlaintext && !string.IsNullOrEmpty(RoomBox.Text.Trim()))
+            {
+                // 预先通知: 连不上会提示可退回明文
+                PushEvent("[TLS] 启用 wss 加密 + TOFU 证书钉定. 服务器不支持 TLS 时会提示回退.");
             }
 
             _session.OnAuthResult += (ok, info) =>
@@ -139,6 +276,11 @@ namespace E2EChatClient.UI
                         PushEvent("[DoubleRatchet] HKDF-SHA512 双链棘轮就绪");
                         // 主动通知房间,让其他成员注册我的临时公钥(以防服务器 new_member 广播次序错位)
                         _session?.NotifyRoomIAmHere();
+                        // F5: 房主才显示可踢人; 更新踢出按钮状态
+                        if (_session?.IsOwner == true) {
+                            PushEvent("[房主] 你是本房房主, 可踢出其他成员 (踢出后 10 分钟禁入)");
+                        }
+                        UpdateKickButtonState();
                     }
                     else
                     {
@@ -246,6 +388,58 @@ namespace E2EChatClient.UI
                 });
             };
 
+            // F5: 成员列表选中变化时更新踢人按钮状态
+            MembersList.SelectionChanged += (s, e) => UpdateKickButtonState();
+
+            // F5: 本用户被房主踢出
+            _session.OnKicked += (reason) =>
+            {
+                Dispatcher.Invoke(() =>
+                {
+                    PushEvent($"[⚠ 被踢出] {reason}. 10 分钟内不可再加入该房.");
+                    ConnStatus.Text = "● 已被房主踢出";
+                    ConnStatus.Foreground = (SolidColorBrush)new BrushConverter().ConvertFrom("#f38ba8");
+                    SendBtn.IsEnabled = false;
+                    KickBtn.IsEnabled = false;
+                    ConnBtn.Content = "连接";
+                    ConnBtn.Background = (SolidColorBrush)new BrushConverter().ConvertFrom("#89b4fa");
+                    MembersList.Items.Clear();
+                    // 释放已断的会话, 让用户点一次"连接"即可重连 (无需先清理死会话).
+                    // 服务器已 disconnect 本 sid, 此处 Dispose 只是回收本地资源.
+                    _session?.Dispose();
+                    _session = null;
+                    System.Windows.MessageBox.Show(
+                        "你已被房主踢出该房间.\n\n10 分钟内不可再加入此房.\n" +
+                        "如需重新加入, 请等待 10 分钟后重试.",
+                        "被踢出房间",
+                        MessageBoxButton.OK, MessageBoxImage.Warning);
+                });
+            };
+
+            // F5: 房内另一成员被踢出 — 从成员列表移除
+            _session.OnMemberKicked += (kickedSid) =>
+            {
+                Dispatcher.Invoke(() =>
+                {
+                    var item = MembersList.Items.OfType<ListBoxItem>().FirstOrDefault(x =>
+                        x.Tag is ValueTuple<string, string> t && t.Item1 == kickedSid);
+                    if (item != null) MembersList.Items.Remove(item);
+                    PushEvent($"[成员] 被房主踢出 → sid={kickedSid}");
+                });
+            };
+
+            // F5: 踢人操作结果
+            _session.OnKickResult += (ok, reason) =>
+            {
+                Dispatcher.Invoke(() =>
+                {
+                    if (ok)
+                        PushEvent("[踢人] 成功: 目标已被移出房间并 10 分钟禁入");
+                    else
+                        PushEvent($"[踢人] 失败: {reason}");
+                });
+            };
+
             ConnStatus.Text = "● 正在认证...";
             ConnStatus.Foreground = (SolidColorBrush)new BrushConverter().ConvertFrom("#f9e2af");
             try
@@ -263,10 +457,41 @@ namespace E2EChatClient.UI
             }
             catch (Exception ex)
             {
-                ConnStatus.Text = "● 连接异常: " + ex.Message;
+                string hint = ex switch
+                {
+                    System.Net.WebSockets.WebSocketException wse when (wse.WebSocketErrorCode == System.Net.WebSockets.WebSocketError.NotAWebSocket)
+                        => "服务器在线但握手被拒 (HTTP 状态非 101).\n可能: 服务器没跑 socket.io / URL 不对",
+                    System.Net.WebSockets.WebSocketException
+                        => "WebSocket 无法建立连接.\n常见原因: 服务器没启动 / 端口被防火墙拦",
+                    System.Security.Authentication.AuthenticationException
+                        => "TLS 证书不匹配.\n· 服务器换了证书 → 这是 TOFU 防伪正常行为, 先确认服务器是否真的换了证书\n· 如果确实换了, 删 %LOCALAPPDATA%\\E2EChatClient\\tofu_pins.json 再试",
+                    _ => ex.Message,
+                };
+                ConnStatus.Text = "● 连接失败: " + hint.Split('\n')[0];
                 ConnStatus.Foreground = (SolidColorBrush)new BrushConverter().ConvertFrom("#f38ba8");
+                PushEvent("[连接失败] " + hint);
+
                 _session?.Dispose();
                 _session = null;
+
+                // wss 失败 → 询问是否回落到明文 ws://
+                if (!usePlaintext)
+                {
+                    var ans = System.Windows.MessageBox.Show(
+                        "加密连接失败。\n\n" +
+                        hint + "\n\n" +
+                        "要改用明文 ws:// 再试吗? (不安全, 消息可能被窃听)",
+                        "要回退明文吗",
+                        System.Windows.MessageBoxButton.YesNo,
+                        System.Windows.MessageBoxImage.Question,
+                        System.Windows.MessageBoxResult.No);
+                    if (ans == System.Windows.MessageBoxResult.Yes) {
+                        usePlaintext = true;
+                        PushEvent("[回退] 用户选择明文 ws 重试");
+                        goto retry_connect;
+                    }
+                }
+                return;
             }
         }
 
@@ -293,27 +518,30 @@ namespace E2EChatClient.UI
         // ============================================================
         private void PushChat(string name, string text, bool incoming)
         {
+            // 液晶玻璃气泡: 自己 = 柔绿高光, 对方 = 白带细描边
             Border bubble = new()
             {
-                Background = (SolidColorBrush)new BrushConverter().ConvertFrom(incoming ? "#313244" : "#a6e3a1"),
-                CornerRadius = new CornerRadius(8),
-                Padding = new Thickness(8),
-                Margin = new Thickness(0, 0, 0, 6),
+                Background = (SolidColorBrush)new BrushConverter().ConvertFrom(incoming ? "#33FFFFFF" : "#668FE6A8"),
+                BorderBrush = (SolidColorBrush)new BrushConverter().ConvertFrom(incoming ? "#40FFFFFF" : "#80FFFFFF"),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(14),
+                Padding = new Thickness(12, 8, 12, 8),
+                Margin = new Thickness(0, 0, 0, 8),
                 HorizontalAlignment = incoming ? HorizontalAlignment.Left : HorizontalAlignment.Right,
             };
             TextBlock header = new()
             {
                 Text = name,
-                Foreground = (SolidColorBrush)new BrushConverter().ConvertFrom("#a6adc8"),
+                Foreground = (SolidColorBrush)new BrushConverter().ConvertFrom("#BFCCD8"),
                 FontSize = 10,
-                Margin = new Thickness(0, 0, 0, 2),
+                Margin = new Thickness(0, 0, 0, 3),
             };
             TextBlock body = new()
             {
                 Text = text,
-                Foreground = (SolidColorBrush)new BrushConverter().ConvertFrom(incoming ? "#cdd6f4" : "Black"),
+                Foreground = (SolidColorBrush)new BrushConverter().ConvertFrom(incoming ? "#F2F6FF" : "#0B0F1A"),
                 TextWrapping = TextWrapping.Wrap,
-                MaxWidth = 540,
+                MaxWidth = 560,
             };
             StackPanel panel = new();
             panel.Children.Add(header);
@@ -359,6 +587,8 @@ namespace E2EChatClient.UI
         protected override void OnClosed(EventArgs e)
         {
             _session?.Dispose();
+            // F5-identity: 持久化身份密钥由 MainWindow 拥有生命周期, 窗口关闭时 zeroize
+            _identityKey.Dispose();
             base.OnClosed(e);
         }
 
@@ -380,18 +610,16 @@ namespace E2EChatClient.UI
                 return;
             }
             string host = HostBox.Text.Trim();
-            int port = int.Parse(PortBox.Text.Trim());
-            using var creator = new ChatSessionV2(host, port);
-            if (TlsBox.IsChecked == true) {
-                string fp = CertShaBox.Text.Trim().ToLowerInvariant();
-                if (string.IsNullOrEmpty(fp)) {
-                    MessageBox.Show("勾了 TLS 但没填指纹. 取消创建.");
-                    return;
-                }
-                creator.UseTls = true;
-                creator.AllowSelfSigned = false;
-                creator.ServerCertSha256 = fp;
+            // BUG-10 修复: 同 ConnBtn_Click, 用 TryParse 防崩溃
+            if (!int.TryParse(PortBox.Text.Trim(), out int port) || port < 1 || port > 65535) {
+                MessageBox.Show("端口必须是 1-65535 的数字", "端口无效");
+                return;
             }
+            using var creator = new ChatSessionV2(host, port, _identityKey);
+            // TOFU: 创建房间也走加密, 0 配置
+            creator.UseTls = true;
+            creator.AllowSelfSigned = false;
+            creator.ServerCertSha256 = null;
             PushEvent($"[房间] 创建中: {room} (密码{(string.IsNullOrEmpty(pw) ? "—" : "已设")})");
             bool ok = await creator.CreateRoomAsync(room, string.IsNullOrEmpty(pw) ? null : pw);
             if (ok) {
@@ -405,7 +633,7 @@ namespace E2EChatClient.UI
                                 MessageBoxButton.OK, MessageBoxImage.Information);
             } else {
                 PushEvent($"[房间] 创建失败: {room} (可能撞名已被他人占用 / ep_sig 校验失败)");
-                MessageBox.Show($"创建失败. 可能: 房间名已被他人占用 / id_sig 无效 / 服务器未启 / 没勾 TLS 但服务端是 wss.",
+                MessageBox.Show($"创建失败. 可能: 房间名已被他人占用 / id_sig 无效 / 服务器未启 / 服务器不支持 wss.",
                                 "创建房间失败",
                                 MessageBoxButton.OK, MessageBoxImage.Warning);
             }
@@ -421,6 +649,47 @@ namespace E2EChatClient.UI
                 MessageBox.Show("先点 \"连接\" 进入服务器后才能查房.",
                                 "未连接", MessageBoxButton.OK, MessageBoxImage.Information);
             }
+        }
+
+        // ============================================================
+        //  F5: 房主踢人
+        // ============================================================
+        private void KickBtn_Click(object sender, RoutedEventArgs e)
+        {
+            if (_session == null || !_session.IsOwner) {
+                MessageBox.Show("仅房主可踢人.", "无权限", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+            string? targetSid = null;
+            if (MembersList.SelectedItem is ListBoxItem li
+                && li.Tag is ValueTuple<string, string> tag) {
+                targetSid = tag.Item1;
+            }
+            if (string.IsNullOrEmpty(targetSid)) {
+                MessageBox.Show("请先在成员列表中选中要踢出的成员.",
+                                "未选中成员", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+            // 二次确认
+            var result = MessageBox.Show(
+                $"确定踢出成员 sid={targetSid}?\n\n该成员将被立即断开, 且 10 分钟内不可再加入本房.",
+                "确认踢出", MessageBoxButton.YesNo, MessageBoxImage.Question,
+                MessageBoxResult.No);
+            if (result != MessageBoxResult.Yes) return;
+
+            _session.KickMember(targetSid);
+            PushEvent($"[踢人] 已发起: 目标 sid={targetSid}");
+        }
+
+        /// <summary>
+        /// F5: 更新踢人按钮可用状态 — 仅房主 + 已选中某成员时可用.
+        /// </summary>
+        private void UpdateKickButtonState()
+        {
+            bool canKick = _session != null
+                           && _session.IsOwner
+                           && MembersList.SelectedItem is ListBoxItem;
+            KickBtn.IsEnabled = canKick;
         }
     }
 

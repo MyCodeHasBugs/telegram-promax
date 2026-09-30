@@ -28,6 +28,35 @@ public sealed class Ed25519Keypair : IDisposable
     }
 
     /// <summary>
+    /// 从 32B 原始私钥种子重建身份密钥对 (用于持久化加载).
+    /// 公钥由私钥确定性派生, 保证跨重启 id_pub 稳定.
+    /// </summary>
+    public static Ed25519Keypair FromPrivateKey(byte[] privateKey)
+    {
+        if (privateKey == null || privateKey.Length != 32)
+            throw new ArgumentException("privateKey must be 32 bytes", nameof(privateKey));
+        var algo = SignatureAlgorithm.Ed25519;
+        var key = Key.Import(algo, privateKey, KeyBlobFormat.RawPrivateKey,
+                             new KeyCreationParameters {
+                                 ExportPolicy = KeyExportPolicies.AllowPlaintextExport
+                             });
+        byte[] pub  = key.PublicKey.Export(KeyBlobFormat.RawPublicKey);
+        byte[] priv = key.Export(KeyBlobFormat.RawPrivateKey);
+        key.Dispose();
+        return new Ed25519Keypair { PublicKey = pub, _privateKey = priv };
+    }
+
+    /// <summary>
+    /// 导出 32B 原始私钥种子 (用于持久化落盘). 返回副本, 调用方负责 zeroize.
+    /// </summary>
+    public byte[] ExportPrivateKey()
+    {
+        if (_privateKey == null)
+            throw new InvalidOperationException("no private key (disposed?)");
+        return (byte[])_privateKey.Clone();
+    }
+
+    /// <summary>
     /// 用导入的 NSec Key 对象做缓存, 避免每次 Sign 都 import 一次临时 Key 不释放
     /// 导致 raw private key 在堆里漂着到 GC. 第一次调用惰性 import, 后续复用.
     /// </summary>

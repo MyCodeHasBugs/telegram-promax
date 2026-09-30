@@ -22,6 +22,11 @@
   <ItemGroup>
     <PackageReference Include="NSec.Cryptography" Version="26.4.0" />
     <PackageReference Include="Blake3" Version="2.2.1" />
+    <!-- 后量子: NIST FIPS 203 ML-KEM (原 Kyber1024), 与 X25519 做混合握手 -->
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.6.1" />
+    <!-- OpenGL 动态液态玻璃背景 -->
+    <PackageReference Include="OpenTK" Version="4.9.4" />
+    <PackageReference Include="GLWpfControl" Version="1.0.0" />
   </ItemGroup>
 
 </Project>

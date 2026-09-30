@@ -29,8 +29,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
 
-def _ask_password() -> bytes:
-    """交互式要求输入并二次确认口令. 返回 utf-8 bytes."""
+def _ask_password() -> bytearray:
+    """交互式要求输入并二次确认口令. 返回 utf-8 bytearray (可变, 可安全 zeroize)."""
     while True:
         pw = getpass.getpass("私钥加密口令 (>= 12 字符): ")
         if len(pw) < 12:
@@ -40,10 +40,10 @@ def _ask_password() -> bytes:
         if pw != pw2:
             print("[gen-cert] 两次输入不一致, 请重试.", flush=True)
             continue
-        return pw.encode("utf-8")
+        return bytearray(pw.encode("utf-8"))
 
 
-def main(out_dir=None, key_password: bytes | None = None):
+def main(out_dir=None, key_password: bytearray | bytes | None = None):
     if out_dir is None:
         out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs")
     os.makedirs(out_dir, exist_ok=True)
@@ -51,6 +51,12 @@ def main(out_dir=None, key_password: bytes | None = None):
     # Pass2-F6: 私钥必须口令加密. 默认交互式 prompt; CLI 可传 --password-stdin.
     if key_password is None:
         key_password = _ask_password()
+    # BUG-4 修复: 统一转成 bytearray (可变, 可安全 zeroize).
+    #   bytes 不可变, 即使 ctypes 写入也会被 Python 的 intern/共享机制保护.
+    if isinstance(key_password, (bytes, bytearray)):
+        key_password = bytearray(key_password)
+    else:
+        raise SystemExit("[FATAL] key_password 类型非法")
     if not key_password or len(key_password) < 12:
         raise SystemExit("[FATAL] 私钥口令必须 >= 12 字符 (防爆破). 拒绝生成明文私钥.")
 
@@ -95,19 +101,25 @@ def main(out_dir=None, key_password: bytes | None = None):
         f.write(cert.public_bytes(serialization.Encoding.PEM))
     # Pass2-F6: 私钥 BestAvailableEncryption (cryptography 用 AES-256-CBC + PBKDF2).
     # 之前 NoEncryption() 明文落盘 = 主机脱库即私钥泄露, 改后必须带口令才能 load.
+    # BUG-4 修复: BestAvailableEncryption 需要 bytes, 从 bytearray 创建一次性副本.
     encrypted_key = priv.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.TraditionalOpenSSL,
-        encryption_algorithm=serialization.BestAvailableEncryption(key_password),
+        encryption_algorithm=serialization.BestAvailableEncryption(bytes(key_password)),
     )
     with open(key_path, "wb") as f:
         f.write(encrypted_key)
-    # 用完即清, 防 Python GC 不及时
-    if isinstance(key_password, bytes):
-        try:
-            import ctypes; ctypes.memmove((ctypes.c_char * len(key_password)).from_address_copy(id(key_password)), b"\x00" * len(key_password), len(key_password))
-        except Exception:
-            pass
+    # BUG-4 修复: 正确 zeroize bytearray.
+    #   旧代码用 from_address_copy (不存在的方法) -> AttributeError 被 except 吞 -> 密码永远不清.
+    #   新代码用 from_buffer (共享内存) + ctypes.memset 正确清零.
+    try:
+        import ctypes
+        ctypes.memset(
+            (ctypes.c_char * len(key_password)).from_buffer(key_password),
+            0, len(key_password))
+    except Exception:
+        pass
+    key_password.clear()  # 双保险: bytearray.clear() 释放内部 buffer
 
     der = cert.public_bytes(serialization.Encoding.DER)
     fp = hashlib.sha256(der).hexdigest()
@@ -126,8 +138,8 @@ if __name__ == "__main__":
     ap.add_argument("--password-stdin", action="store_true",
                     help="read key passphrase from stdin instead of interactive prompt")
     args = ap.parse_args()
-    pw: bytes | None = None
+    pw: bytearray | None = None
     if args.password_stdin:
         line = sys.stdin.readline().rstrip("\n")
-        pw = line.encode("utf-8")
+        pw = bytearray(line.encode("utf-8"))
     main(key_password=pw)

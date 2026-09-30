@@ -337,6 +337,15 @@ public sealed class DoubleRatchet : IDisposable
                     }
                     if (_skippedTotal > MAX_SKIPPED_KEYS) break;
                 }
+                // BUG-8 修复: break 后 _recvN 可能 < n (skipped 表满).
+                //   旧代码继续用 _recvN (≠n) 取 msg key → 与发送方 n 不匹配 → 永远解密失败,
+                //   且 chain 已推进 → 后续所有消息也解不开 → 会话永久失同步.
+                //   修复: 若 _recvN != n 直接返回 GapTooLarge, 让上层丢弃这条消息.
+                if (_recvN != n)
+                    return new DecryptOutcome {
+                        Verdict = RatchetVerdict.GapTooLarge,
+                        Reason = $"skipped keys full ({_skippedTotal}/{MAX_SKIPPED_KEYS}), n={n} > recvN={_recvN}"
+                    };
                 // 此时 _recvN == n
                 byte[] mk = null!;
                 byte[] newChain2 = null!;
@@ -406,6 +415,12 @@ public sealed class DoubleRatchet : IDisposable
                 }
                 if (_skippedTotal > MAX_SKIPPED_KEYS) break;
             }
+            // BUG-8 修复 (同上分支): DH ratchet recv 后跳号超限也要返回 GapTooLarge
+            if (_recvN != n)
+                return new DecryptOutcome {
+                    Verdict = RatchetVerdict.GapTooLarge,
+                    Reason = $"new-dh skipped keys full ({_skippedTotal}/{MAX_SKIPPED_KEYS}), n={n} > recvN={_recvN}"
+                };
             byte[] mk2 = null!;
             byte[] newChainLast = null!;
             try {
